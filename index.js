@@ -1,16 +1,20 @@
 require("dotenv").config();
+
 const express = require("express");
 const path = require("path");
+const { Pool } = require("pg");
 
 const app = express();
 app.use(express.json());
 
-const BOT_VERSION = "3.0.0";
+const BOT_VERSION = "4.0.0";
 const PORT = process.env.PORT || 3000;
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const DATABASE_URL = process.env.DATABASE_URL;
+
 const GRAPH_API_VERSION =
   process.env.GRAPH_API_VERSION || "v26.0";
 
@@ -18,45 +22,324 @@ const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL ||
   "https://aca-whatsapp-bot.onrender.com";
 
-const MENU_URL = `${PUBLIC_BASE_URL}/menu.pdf`;
-
 const HUMAN_HANDOFF_MINUTES = Number(
   process.env.HUMAN_HANDOFF_MINUTES || "30"
 );
 
-const CAFE_ADDRESS =
-  (process.env.CAFE_ADDRESS || "").trim();
+const MENU_URL = `${PUBLIC_BASE_URL}/menu.pdf`;
+
+
+// ======================================================
+// AMINA CAFE
+// ======================================================
 
 const CAFE = {
   name: "Amina Cafe",
+
   workHours: "10:00–00:00",
+
   musicHours: "19:00–23:00",
+
   deliveryHours: "10:00–22:30",
-  bookingPhone: "8 705 286 57 88",
-  deliveryPhone: "8 777 488 21 41",
-  instagram: "@cafe_amina",
+
+  address:
+    "ул. Суюнбая, 34, 40600/B34C6P0\n" +
+    "с. Узынагаш, Алматинская область\n" +
+    "1 этаж",
+
+  mapUrl:
+    "https://2gis.kz/almaty/geo/70000001086742095/76.327236,43.211271",
+
+  bookingPhone:
+    "8 705 286 57 88",
+
+  deliveryPhone:
+    "8 777 488 21 41",
+
+  instagram:
+    "@cafe_amina"
 };
 
 
-// =========================================================
-// ВРЕМЕННОЕ ХРАНЕНИЕ СОСТОЯНИЯ
-// =========================================================
+// ======================================================
+// POSTGRESQL
+// ======================================================
 
-const sessions = new Map();
-const processedMessageIds = new Set();
+let pool = null;
 
-
-function getSession(phone) {
-  if (!sessions.has(phone)) {
-    sessions.set(phone, {
-      lang: "ru",
-      humanUntil: 0,
-    });
-  }
-
-  return sessions.get(phone);
+if (DATABASE_URL) {
+  pool = new Pool({
+    connectionString: DATABASE_URL
+  });
 }
 
+
+async function initDatabase() {
+  if (!pool) {
+    console.warn(
+      "⚠️ DATABASE_URL отсутствует. Работаем без постоянной памяти."
+    );
+
+    return;
+  }
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bot_sessions (
+      phone VARCHAR(32) PRIMARY KEY,
+      language VARCHAR(5) NOT NULL DEFAULT 'ru',
+      human_until TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  console.log("🗄 PostgreSQL connected ✅");
+}
+
+
+// ======================================================
+// FALLBACK-ПАМЯТЬ
+// если база временно недоступна
+// ======================================================
+
+const memorySessions = new Map();
+
+
+function defaultSession(phone) {
+  return {
+    phone,
+    language: "ru",
+    humanUntil: null
+  };
+}
+
+
+// ======================================================
+// СЕССИЯ КЛИЕНТА
+// ======================================================
+
+async function getSession(phone) {
+  if (!pool) {
+    if (!memorySessions.has(phone)) {
+      memorySessions.set(
+        phone,
+        defaultSession(phone)
+      );
+    }
+
+    return memorySessions.get(phone);
+  }
+
+  const result = await pool.query(
+    `
+    SELECT
+      phone,
+      language,
+      human_until
+    FROM bot_sessions
+    WHERE phone = $1
+    `,
+    [phone]
+  );
+
+  if (result.rows.length > 0) {
+    const row = result.rows[0];
+
+    return {
+      phone: row.phone,
+
+      language:
+        row.language || "ru",
+
+      humanUntil:
+        row.human_until
+          ? new Date(row.human_until)
+          : null
+    };
+  }
+
+  await pool.query(
+    `
+    INSERT INTO bot_sessions
+      (phone, language)
+    VALUES
+      ($1, 'ru')
+    ON CONFLICT (phone)
+    DO NOTHING
+    `,
+    [phone]
+  );
+
+  return defaultSession(phone);
+}
+
+
+// ======================================================
+// СОХРАНЕНИЕ ЯЗЫКА
+// ======================================================
+
+async function saveLanguage(
+  phone,
+  language
+) {
+  if (!pool) {
+    const session =
+      await getSession(phone);
+
+    session.language =
+      language;
+
+    memorySessions.set(
+      phone,
+      session
+    );
+
+    return;
+  }
+
+  await pool.query(
+    `
+    INSERT INTO bot_sessions
+      (
+        phone,
+        language,
+        updated_at
+      )
+    VALUES
+      (
+        $1,
+        $2,
+        NOW()
+      )
+
+    ON CONFLICT (phone)
+
+    DO UPDATE SET
+      language = EXCLUDED.language,
+      updated_at = NOW()
+    `,
+    [
+      phone,
+      language
+    ]
+  );
+}
+
+
+// ======================================================
+// РЕЖИМ СОТРУДНИКА
+// ======================================================
+
+async function enableHumanMode(
+  phone
+) {
+  const humanUntil =
+    new Date(
+      Date.now() +
+      HUMAN_HANDOFF_MINUTES *
+      60 *
+      1000
+    );
+
+  if (!pool) {
+    const session =
+      await getSession(phone);
+
+    session.humanUntil =
+      humanUntil;
+
+    memorySessions.set(
+      phone,
+      session
+    );
+
+    return;
+  }
+
+  await pool.query(
+    `
+    INSERT INTO bot_sessions
+      (
+        phone,
+        human_until,
+        updated_at
+      )
+
+    VALUES
+      (
+        $1,
+        $2,
+        NOW()
+      )
+
+    ON CONFLICT (phone)
+
+    DO UPDATE SET
+      human_until =
+        EXCLUDED.human_until,
+
+      updated_at =
+        NOW()
+    `,
+    [
+      phone,
+      humanUntil
+    ]
+  );
+}
+
+
+async function disableHumanMode(
+  phone
+) {
+  if (!pool) {
+    const session =
+      await getSession(phone);
+
+    session.humanUntil =
+      null;
+
+    memorySessions.set(
+      phone,
+      session
+    );
+
+    return;
+  }
+
+  await pool.query(
+    `
+    UPDATE bot_sessions
+    SET
+      human_until = NULL,
+      updated_at = NOW()
+    WHERE phone = $1
+    `,
+    [phone]
+  );
+}
+
+
+function isHumanMode(
+  session
+) {
+  if (!session.humanUntil) {
+    return false;
+  }
+
+  return (
+    new Date(
+      session.humanUntil
+    ).getTime()
+    >
+    Date.now()
+  );
+}
+
+
+// ======================================================
+// ТЕКСТ
+// ======================================================
 
 function normalizeText(text) {
   return (text || "")
@@ -66,41 +349,16 @@ function normalizeText(text) {
 
 
 function looksKazakh(text) {
-  return /[әғқңөұүһі]/i.test(text || "");
+  return /[әғқңөұүһі]/i
+    .test(text || "");
 }
 
 
-function isHumanMode(session) {
-  return session.humanUntil > Date.now();
-}
-
-
-function enableHumanMode(session) {
-  session.humanUntil =
-    Date.now() +
-    HUMAN_HANDOFF_MINUTES * 60 * 1000;
-}
-
-
-function disableHumanMode(session) {
-  session.humanUntil = 0;
-}
-
-
-// =========================================================
-// ЕДИНЫЙ КРАСИВЫЙ СТИЛЬ
-// =========================================================
-//
-// ВАЖНО:
-// И главное меню, и ответ на непонятную команду
-// используют ОДНУ функцию menuOptions().
-//
-// Поэтому стиль больше не может отличаться.
-// =========================================================
-
+// ======================================================
+// ЕДИНЫЙ ДИЗАЙН
+// ======================================================
 
 function menuOptions(lang) {
-
   if (lang === "kk") {
     return `1 — 📋 Мәзір
 2 — 🕐 Жұмыс уақыты және байланыс
@@ -109,7 +367,6 @@ function menuOptions(lang) {
 
 0 — 🏠 Басты мәзір`;
   }
-
 
   return `1 — 📋 Меню
 2 — 🕐 Время работы и контакты
@@ -120,23 +377,19 @@ function menuOptions(lang) {
 }
 
 
-// =========================================================
+// ======================================================
 // ГЛАВНОЕ МЕНЮ
-// =========================================================
+// ======================================================
 
 function mainMenu(lang) {
-
   if (lang === "kk") {
-
     return `Сәлеметсіз бе! 👋
 ${CAFE.name}-ге қош келдіңіз.
 
 Қажетті бөлімді таңдаңыз:
 
 ${menuOptions("kk")}`;
-
   }
-
 
   return `Здравствуйте! 👋
 Добро пожаловать в ${CAFE.name}.
@@ -144,103 +397,101 @@ ${menuOptions("kk")}`;
 Выберите нужный раздел:
 
 ${menuOptions("ru")}`;
-
 }
 
 
-// =========================================================
-// ЕСЛИ БОТ НЕ ПОНЯЛ СООБЩЕНИЕ
-// =========================================================
-//
-// ВАЖНО:
-// здесь тоже используется menuOptions().
-// Поэтому никаких:
-//
-// 1 — Меню
-// 2 — Контакты
-// 3 — Сотрудник
-//
-// больше нет.
-// =========================================================
+// ======================================================
+// НЕПОНЯТНАЯ КОМАНДА
+// ======================================================
 
 function unknownMessage(lang) {
-
   if (lang === "kk") {
-
     return `Мен бұл хабарламаны түсінбедім 🙂
 
 Төмендегі бөлімдердің бірін таңдаңыз:
 
 ${menuOptions("kk")}`;
-
   }
-
 
   return `Я не понял сообщение 🙂
 
 Пожалуйста, выберите один из разделов:
 
 ${menuOptions("ru")}`;
-
 }
 
 
-// =========================================================
-// ВРЕМЯ РАБОТЫ И КОНТАКТЫ
-// =========================================================
+// ======================================================
+// КОНТАКТЫ + АДРЕС + 2GIS
+// ======================================================
 
 function infoMessage(lang) {
-
-  const addressRu = CAFE_ADDRESS
-    ? `📍 Адрес: ${CAFE_ADDRESS}\n`
-    : "";
-
-
-  const addressKk = CAFE_ADDRESS
-    ? `📍 Мекенжай: ${CAFE_ADDRESS}\n`
-    : "";
-
-
   if (lang === "kk") {
-
     return `🕐 ${CAFE.name}
 
-🕙 Жұмыс уақыты: ${CAFE.workHours}
-🎶 Музыкалық бағдарлама: ${CAFE.musicHours}
-🚚 Жеткізу уақыты: ${CAFE.deliveryHours}
+🕙 Жұмыс уақыты:
+${CAFE.workHours}
 
-${addressKk}📞 Үстел броньдау: ${CAFE.bookingPhone}
-🛵 Жеткізу: ${CAFE.deliveryPhone}
-📱 Instagram: ${CAFE.instagram}
+🎶 Музыкалық бағдарлама:
+${CAFE.musicHours}
+
+🚚 Жеткізу уақыты:
+${CAFE.deliveryHours}
+
+📍 Мекенжай:
+${CAFE.address}
+
+🗺 2GIS:
+${CAFE.mapUrl}
+
+📞 Үстел броньдау:
+${CAFE.bookingPhone}
+
+🛵 Жеткізу:
+${CAFE.deliveryPhone}
+
+📱 Instagram:
+${CAFE.instagram}
 
 0 — 🏠 Басты мәзір`;
-
   }
-
 
   return `🕐 ${CAFE.name}
 
-🕙 Время работы: ${CAFE.workHours}
-🎶 Музыкальное оформление: ${CAFE.musicHours}
-🚚 Доставка: ${CAFE.deliveryHours}
+🕙 Время работы:
+${CAFE.workHours}
 
-${addressRu}📞 Бронь столов: ${CAFE.bookingPhone}
-🛵 Доставка: ${CAFE.deliveryPhone}
-📱 Instagram: ${CAFE.instagram}
+🎶 Музыкальное оформление:
+${CAFE.musicHours}
+
+🚚 Доставка:
+${CAFE.deliveryHours}
+
+📍 Адрес:
+${CAFE.address}
+
+🗺 Открыть в 2GIS:
+${CAFE.mapUrl}
+
+📞 Бронь столов:
+${CAFE.bookingPhone}
+
+🛵 Доставка:
+${CAFE.deliveryPhone}
+
+📱 Instagram:
+${CAFE.instagram}
 
 0 — 🏠 Главное меню`;
-
 }
 
 
-// =========================================================
-// РЕЖИМ СОТРУДНИКА
-// =========================================================
+// ======================================================
+// СОТРУДНИК
+// ======================================================
 
 function humanModeMessage(lang) {
-
   if (lang === "kk") {
-
     return `👨‍💼 Қызметкер режимі қосылды.
 
 Келесі ${HUMAN_HANDOFF_MINUTES} минут бот автоматты түрде жауап бермейді.
@@ -251,9 +502,7 @@ function humanModeMessage(lang) {
 БОТ
 
 0 — 🏠 Басты мәзір`;
-
   }
-
 
   return `👨‍💼 Режим сотрудника включён.
 
@@ -266,155 +515,164 @@ function humanModeMessage(lang) {
 БОТ
 
 0 — 🏠 Главное меню`;
-
 }
 
 
-// =========================================================
-// БОТ СНОВА ВКЛЮЧЁН
-// =========================================================
-
 function botResumedMessage(lang) {
-
   if (lang === "kk") {
-
     return `🤖 Бот қайта қосылды.
 
 ${mainMenu("kk")}`;
-
   }
-
 
   return `🤖 Бот снова включён.
 
 ${mainMenu("ru")}`;
-
 }
 
 
-// =========================================================
+// ======================================================
 // HTTP
-// =========================================================
-
+// ======================================================
 
 app.get("/", (req, res) => {
-
   res
     .status(200)
     .send(
       `Aca WhatsApp bot v${BOT_VERSION} is running ✅`
     );
-
 });
 
 
-app.get("/health", (req, res) => {
+app.get(
+  "/health",
+  async (req, res) => {
+    let database =
+      false;
 
-  res.status(200).json({
-    ok: true,
-    version: BOT_VERSION,
-    bot: "Aca",
-    menu: MENU_URL,
-  });
+    if (pool) {
+      try {
+        await pool.query(
+          "SELECT 1"
+        );
 
-});
+        database =
+          true;
+      } catch (error) {
+        console.error(
+          "Database health error:",
+          error.message
+        );
 
+        database =
+          false;
+      }
+    }
 
-// =========================================================
-// PDF-МЕНЮ
-// =========================================================
-
-app.get("/menu.pdf", (req, res) => {
-
-  res.sendFile(
-    path.join(
-      __dirname,
-      "Amina-Cafe-Menu.pdf"
-    )
-  );
-
-});
-
-
-// =========================================================
-// ПРОВЕРКА WEBHOOK META
-// =========================================================
-
-app.get("/webhook", (req, res) => {
-
-  const mode =
-    req.query["hub.mode"];
-
-  const token =
-    req.query["hub.verify_token"];
-
-  const challenge =
-    req.query["hub.challenge"];
+    res.status(200).json({
+      ok: true,
+      version: BOT_VERSION,
+      database,
+      bot: "Aca",
+      menu: MENU_URL
+    });
+  }
+);
 
 
-  if (
-    mode === "subscribe" &&
-    token === VERIFY_TOKEN
-  ) {
+// ======================================================
+// PDF MENU
+// ======================================================
 
-    console.log(
-      "Webhook verified ✅"
+app.get(
+  "/menu.pdf",
+  (req, res) => {
+    res.sendFile(
+      path.join(
+        __dirname,
+        "Amina-Cafe-Menu.pdf"
+      )
     );
+  }
+);
+
+
+// ======================================================
+// META WEBHOOK VERIFY
+// ======================================================
+
+app.get(
+  "/webhook",
+  (req, res) => {
+    const mode =
+      req.query["hub.mode"];
+
+    const token =
+      req.query[
+        "hub.verify_token"
+      ];
+
+    const challenge =
+      req.query[
+        "hub.challenge"
+      ];
+
+    if (
+      mode === "subscribe" &&
+      token === VERIFY_TOKEN
+    ) {
+      console.log(
+        "Webhook verified ✅"
+      );
+
+      return res
+        .status(200)
+        .send(challenge);
+    }
 
     return res
-      .status(200)
-      .send(challenge);
-
+      .sendStatus(403);
   }
+);
 
 
-  return res.sendStatus(403);
+// ======================================================
+// WHATSAPP API
+// ======================================================
 
-});
-
-
-// =========================================================
-// WHATSAPP CLOUD API
-// =========================================================
-
-
-async function sendWhatsAppPayload(payload) {
-
+async function sendWhatsAppPayload(
+  payload
+) {
   const url =
     `https://graph.facebook.com/` +
     `${GRAPH_API_VERSION}/` +
     `${PHONE_NUMBER_ID}/messages`;
 
+  const response =
+    await fetch(
+      url,
+      {
+        method: "POST",
 
-  const response = await fetch(
-    url,
-    {
+        headers: {
+          Authorization:
+            `Bearer ${WHATSAPP_TOKEN}`,
 
-      method: "POST",
+          "Content-Type":
+            "application/json"
+        },
 
-      headers: {
-
-        Authorization:
-          `Bearer ${WHATSAPP_TOKEN}`,
-
-        "Content-Type":
-          "application/json",
-
-      },
-
-      body:
-        JSON.stringify(payload),
-
-    }
-  );
-
+        body:
+          JSON.stringify(
+            payload
+          )
+      }
+    );
 
   const data =
     await response.json();
 
-
   if (!response.ok) {
-
     console.error(
       "Meta API error:",
       JSON.stringify(
@@ -424,30 +682,24 @@ async function sendWhatsAppPayload(payload) {
       )
     );
 
-
     throw new Error(
       `Meta API returned ${response.status}`
     );
-
   }
 
-
   return data;
-
 }
 
 
-// =========================================================
+// ======================================================
 // ОТПРАВКА ТЕКСТА
-// =========================================================
+// ======================================================
 
 async function sendTextMessage(
   to,
   body
 ) {
-
   return sendWhatsAppPayload({
-
     messaging_product:
       "whatsapp",
 
@@ -460,30 +712,24 @@ async function sendTextMessage(
       "text",
 
     text: {
-
       preview_url:
-        false,
+        true,
 
-      body,
-
-    },
-
+      body
+    }
   });
-
 }
 
 
-// =========================================================
-// ОТПРАВКА PDF-МЕНЮ
-// =========================================================
+// ======================================================
+// ОТПРАВКА PDF
+// ======================================================
 
 async function sendMenuPdf(
   to,
   lang
 ) {
-
   return sendWhatsAppPayload({
-
     messaging_product:
       "whatsapp",
 
@@ -496,7 +742,6 @@ async function sendMenuPdf(
       "document",
 
     document: {
-
       link:
         MENU_URL,
 
@@ -506,35 +751,38 @@ async function sendMenuPdf(
       caption:
         lang === "kk"
           ? "📋 Amina Cafe мәзірі"
-          : "📋 Меню Amina Cafe",
-
-    },
-
+          : "📋 Меню Amina Cafe"
+    }
   });
-
 }
 
 
-// =========================================================
-// ОСНОВНАЯ ЛОГИКА БОТА
-// =========================================================
+// ======================================================
+// ОСНОВНАЯ ЛОГИКА
+// ======================================================
 
 async function handleTextMessage(
   from,
   rawText
 ) {
-
   const msg =
-    normalizeText(rawText);
+    normalizeText(
+      rawText
+    );
+
+  let session =
+    await getSession(
+      from
+    );
+
+  let lang =
+    session.language ||
+    "ru";
 
 
-  const session =
-    getSession(from);
-
-
-  // =======================================================
-  // ВЫХОД ИЗ РЕЖИМА СОТРУДНИКА ЧЕРЕЗ 0
-  // =======================================================
+  // ====================================================
+  // 0 В РЕЖИМЕ СОТРУДНИКА
+  // ====================================================
 
   if (
     isHumanMode(session) &&
@@ -542,187 +790,160 @@ async function handleTextMessage(
       "0",
       "назад",
       "артқа",
-      "артка",
+      "артка"
     ].includes(msg)
   ) {
-
-    disableHumanMode(session);
-
+    await disableHumanMode(
+      from
+    );
 
     await sendTextMessage(
       from,
-      mainMenu(session.lang)
+      mainMenu(lang)
     );
 
-
     return;
-
   }
 
 
-  // =======================================================
-  // КОМАНДА БОТ
-  // =======================================================
+  // ====================================================
+  // БОТ
+  // ====================================================
 
   if (
     [
-
       "бот",
-
       "bot",
-
       "/bot",
-
       "вернуть бота",
-
       "ботты қосу",
-
-      "ботты косу",
-
+      "ботты косу"
     ].includes(msg)
   ) {
-
-    disableHumanMode(session);
-
+    await disableHumanMode(
+      from
+    );
 
     await sendTextMessage(
       from,
       botResumedMessage(
-        session.lang
+        lang
       )
     );
 
-
     return;
-
   }
 
 
-  // =======================================================
-  // ЕСЛИ АКТИВЕН СОТРУДНИК — БОТ МОЛЧИТ
-  // =======================================================
+  // ====================================================
+  // HUMAN MODE
+  // ====================================================
 
   if (
-    isHumanMode(session)
+    isHumanMode(
+      session
+    )
   ) {
-
     console.log(
-      `Human mode active for ${from}; ` +
-      `no automatic reply.`
+      `👨‍💼 Human mode: ${from}`
     );
 
-
     return;
-
   }
 
 
-  // =======================================================
-  // АВТООПРЕДЕЛЕНИЕ КАЗАХСКОГО
-  // =======================================================
+  // ====================================================
+  // АВТО KAZAKH
+  // ====================================================
 
   if (
-    looksKazakh(rawText)
+    looksKazakh(
+      rawText
+    )
   ) {
-
-    session.lang =
+    lang =
       "kk";
 
+    await saveLanguage(
+      from,
+      lang
+    );
   }
 
 
-  // =======================================================
-  // КАЗАХСКИЙ
-  // =======================================================
+  // ====================================================
+  // KAZAKH
+  // ====================================================
 
   if (
     [
-
       "қазақша",
-
       "казакша",
-
       "қазақ тілі",
-
-      "kk",
-
+      "kk"
     ].includes(msg)
   ) {
-
-    session.lang =
+    lang =
       "kk";
 
+    await saveLanguage(
+      from,
+      lang
+    );
 
     await sendTextMessage(
       from,
-      mainMenu("kk")
+      mainMenu(lang)
     );
 
-
     return;
-
   }
 
 
-  // =======================================================
-  // РУССКИЙ
-  // =======================================================
+  // ====================================================
+  // RUSSIAN
+  // ====================================================
 
   if (
     [
-
       "русский",
-
       "рус",
-
-      "ru",
-
+      "ru"
     ].includes(msg)
   ) {
-
-    session.lang =
+    lang =
       "ru";
 
+    await saveLanguage(
+      from,
+      lang
+    );
 
     await sendTextMessage(
       from,
-      mainMenu("ru")
+      mainMenu(lang)
     );
 
-
     return;
-
   }
 
 
-  // =======================================================
-  // ПРИВЕТСТВИЯ
-  // =======================================================
+  // ====================================================
+  // ПРИВЕТ
+  // ====================================================
 
   const greetings = [
-
     "привет",
-
     "здравствуйте",
-
     "добрый день",
-
     "добрый вечер",
-
     "салам",
-
     "сәлем",
-
     "салем",
-
     "сәлеметсіз бе",
-
     "start",
-
-    "/start",
-
+    "/start"
   ];
-
 
   if (
     greetings.includes(msg) ||
@@ -730,49 +951,47 @@ async function handleTextMessage(
       "0",
       "назад",
       "артқа",
-      "артка",
+      "артка"
     ].includes(msg)
   ) {
-
     await sendTextMessage(
       from,
-      mainMenu(session.lang)
+      mainMenu(lang)
     );
 
-
     return;
-
   }
 
 
-  // =======================================================
-  // 4 — ПЕРЕКЛЮЧЕНИЕ ЯЗЫКА
-  // =======================================================
+  // ====================================================
+  // 4 — ЯЗЫК
+  // ====================================================
 
   if (
     msg === "4"
   ) {
-
-    session.lang =
-      session.lang === "kk"
+    lang =
+      lang === "kk"
         ? "ru"
         : "kk";
 
+    await saveLanguage(
+      from,
+      lang
+    );
 
     await sendTextMessage(
       from,
-      mainMenu(session.lang)
+      mainMenu(lang)
     );
 
-
     return;
-
   }
 
 
-  // =======================================================
+  // ====================================================
   // 1 — МЕНЮ
-  // =======================================================
+  // ====================================================
 
   if (
     msg === "1" ||
@@ -780,83 +999,66 @@ async function handleTextMessage(
     msg === "мәзір" ||
     msg === "мазір"
   ) {
-
     await sendMenuPdf(
       from,
-      session.lang
+      lang
     );
 
+    await sendTextMessage(
+      from,
 
-    if (
-      session.lang === "kk"
-    ) {
-
-      await sendTextMessage(
-        from,
-        `📋 Мәзір жоғарыда жіберілді 👆
+      lang === "kk"
+        ? `📋 Мәзір жоғарыда жіберілді 👆
 
 0 — 🏠 Басты мәзір`
-      );
-
-    } else {
-
-      await sendTextMessage(
-        from,
-        `📋 Меню отправлено выше 👆
+        : `📋 Меню отправлено выше 👆
 
 0 — 🏠 Главное меню`
-      );
-
-    }
-
+    );
 
     return;
-
   }
 
 
-  // =======================================================
-  // 2 — ВРЕМЯ / КОНТАКТЫ
-  // =======================================================
+  // ====================================================
+  // 2 — КОНТАКТЫ
+  // ====================================================
 
   if (
     msg === "2" ||
 
-    msg.includes("время") ||
-
-    msg.includes("контакт") ||
-
-    msg.includes("адрес") ||
-
-    msg.includes("байланыс") ||
-
-    msg.includes("мекенжай") ||
-
     msg.includes(
-      "жұмыс уақыты"
+      "время"
     ) ||
 
     msg.includes(
-      "жумыс уакыты"
+      "контакт"
+    ) ||
+
+    msg.includes(
+      "адрес"
+    ) ||
+
+    msg.includes(
+      "байланыс"
+    ) ||
+
+    msg.includes(
+      "мекенжай"
     )
   ) {
-
     await sendTextMessage(
       from,
-      infoMessage(
-        session.lang
-      )
+      infoMessage(lang)
     );
 
-
     return;
-
   }
 
 
-  // =======================================================
+  // ====================================================
   // 3 — СОТРУДНИК
-  // =======================================================
+  // ====================================================
 
   if (
     msg === "3" ||
@@ -881,357 +1083,245 @@ async function handleTextMessage(
       "кызметкер"
     )
   ) {
-
-    enableHumanMode(
-      session
+    await enableHumanMode(
+      from
     );
-
 
     await sendTextMessage(
       from,
       humanModeMessage(
-        session.lang
+        lang
       )
     );
 
-
     return;
-
   }
 
 
-  // =======================================================
-  // НЕИЗВЕСТНОЕ СООБЩЕНИЕ
-  // =======================================================
-  //
-  // Здесь используется unknownMessage(),
-  // а unknownMessage() использует menuOptions().
-  //
-  // Поэтому пункты здесь ТОЧНО такие же,
-  // как в главном меню.
-  // =======================================================
+  // ====================================================
+  // UNKNOWN
+  // ====================================================
 
   await sendTextMessage(
     from,
     unknownMessage(
-      session.lang
+      lang
     )
   );
-
 }
 
 
-// =========================================================
-// ОБРАБОТКА ВХОДЯЩЕГО WHATSAPP-СООБЩЕНИЯ
-// =========================================================
+// ======================================================
+// ЗАЩИТА ОТ ПОВТОРНЫХ WEBHOOK
+// ======================================================
+
+const processedMessages =
+  new Set();
+
+
+// ======================================================
+// INCOMING MESSAGE
+// ======================================================
 
 async function processIncomingMessage(
   message
 ) {
-
   const messageId =
     message?.id;
 
-
-  // =======================================================
-  // ЗАЩИТА ОТ ПОВТОРНЫХ WEBHOOK
-  // =======================================================
-
   if (
     messageId &&
-    processedMessageIds.has(
+    processedMessages.has(
       messageId
     )
   ) {
-
     return;
-
   }
-
 
   if (
     messageId
   ) {
-
-    processedMessageIds.add(
+    processedMessages.add(
       messageId
     );
 
-
     if (
-      processedMessageIds.size >
+      processedMessages.size >
       2000
     ) {
-
       const first =
-        processedMessageIds
+        processedMessages
           .values()
           .next()
           .value;
 
-
-      processedMessageIds.delete(
+      processedMessages.delete(
         first
       );
-
     }
-
   }
-
 
   const from =
     message?.from;
 
-
   if (!from) {
-
     return;
-
   }
 
 
-  const session =
-    getSession(from);
-
-
-  // =======================================================
-  // ТЕКСТ
-  // =======================================================
+  // ====================================================
+  // TEXT
+  // ====================================================
 
   if (
     message.type ===
     "text"
   ) {
-
     const text =
       message.text?.body ||
       "";
 
-
     console.log(
-      `Message from ${from}: ${text}`
+      `💬 ${from}: ${text}`
     );
-
 
     await handleTextMessage(
       from,
       text
     );
 
-
     return;
-
   }
 
 
-  // =======================================================
-  // МЕДИА В РЕЖИМЕ СОТРУДНИКА
-  // =======================================================
+  // ====================================================
+  // MEDIA
+  // ====================================================
 
-  if (
-    isHumanMode(session)
-  ) {
-
-    console.log(
-
-      `Human mode active for ${from}; ` +
-
-      `${message.type} ignored by bot.`
-
+  const session =
+    await getSession(
+      from
     );
 
-
+  if (
+    isHumanMode(
+      session
+    )
+  ) {
     return;
-
   }
 
+  const lang =
+    session.language ||
+    "ru";
 
-  // =======================================================
-  // ПОКА НЕ ПОДДЕРЖИВАЕМ МЕДИА
-  // =======================================================
+  await sendTextMessage(
+    from,
 
-  if (
-    session.lang ===
-    "kk"
-  ) {
-
-    await sendTextMessage(
-
-      from,
-
-      `Әзірге тек мәтіндік хабарламаларды түсінемін 🙂
+    lang === "kk"
+      ? `Әзірге тек мәтіндік хабарламаларды түсінемін 🙂
 
 0 — 🏠 Басты мәзір`
-
-    );
-
-  } else {
-
-    await sendTextMessage(
-
-      from,
-
-      `Пока я понимаю только текстовые сообщения 🙂
+      : `Пока я понимаю только текстовые сообщения 🙂
 
 0 — 🏠 Главное меню`
-
-    );
-
-  }
-
+  );
 }
 
 
-// =========================================================
-// POST WEBHOOK
-// =========================================================
+// ======================================================
+// WEBHOOK POST
+// ======================================================
 
 app.post(
   "/webhook",
   async (req, res) => {
-
-    // Meta должна получить 200 максимально быстро.
     res.sendStatus(200);
 
-
     try {
-
       const entries =
         req.body?.entry ||
         [];
-
 
       for (
         const entry
         of entries
       ) {
-
         const changes =
           entry?.changes ||
           [];
-
 
         for (
           const change
           of changes
         ) {
-
           const messages =
             change
               ?.value
               ?.messages ||
             [];
 
-
           for (
             const message
             of messages
           ) {
-
             try {
-
               await processIncomingMessage(
                 message
               );
-
             } catch (error) {
-
               console.error(
-
-                "Message processing error:",
-
+                "Message error:",
                 error
-
               );
-
             }
-
           }
-
         }
-
       }
-
     } catch (error) {
-
       console.error(
-
-        "Webhook processing error:",
-
+        "Webhook error:",
         error
-
       );
-
     }
-
   }
 );
 
 
-// =========================================================
-// ЗАПУСК СЕРВЕРА
-// =========================================================
+// ======================================================
+// START
+// ======================================================
 
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-
-    console.log(
-      `🚀 Aca Bot v${BOT_VERSION} started on port ${PORT}`
+async function start() {
+  try {
+    await initDatabase();
+  } catch (error) {
+    console.error(
+      "❌ Database init error:",
+      error
     );
-
-
-    const missing =
-      [];
-
-
-    if (
-      !VERIFY_TOKEN
-    ) {
-
-      missing.push(
-        "VERIFY_TOKEN"
-      );
-
-    }
-
-
-    if (
-      !WHATSAPP_TOKEN
-    ) {
-
-      missing.push(
-        "WHATSAPP_TOKEN"
-      );
-
-    }
-
-
-    if (
-      !PHONE_NUMBER_ID
-    ) {
-
-      missing.push(
-        "PHONE_NUMBER_ID"
-      );
-
-    }
-
-
-    if (
-      missing.length
-    ) {
-
-      console.warn(
-
-        `⚠️ Missing environment variables: ` +
-
-        missing.join(", ")
-
-      );
-
-    }
-
   }
-);
+
+  app.listen(
+    PORT,
+    "0.0.0.0",
+    () => {
+      console.log(
+        `🚀 Aca Bot v${BOT_VERSION}`
+      );
+
+      console.log(
+        `🌐 Port: ${PORT}`
+      );
+
+      console.log(
+        pool
+          ? "🗄 Database mode: PostgreSQL"
+          : "🧠 Database mode: Memory"
+      );
+    }
+  );
+}
+
+
+start();
